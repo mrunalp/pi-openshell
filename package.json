@@ -1,0 +1,54 @@
+{
+  "name": "pi-openshell",
+  "version": "0.1.0",
+  "description": "Run Pi Durable coding tools in existing OpenShell sandboxes.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mrunalp/pi-openshell.git"
+  },
+  "keywords": [
+    "pi-durable",
+    "openshell",
+    "sandbox"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "examples"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-worker.mjs",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "test": "npm run build && node --test --test-timeout=30000 test/*.test.mjs",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "prepare": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-durable": "1.0.0",
+    "@nvidia/openshell-sdk": ">=0.0.0 <1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@nvidia/openshell-sdk": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-durable": "1.0.0",
+    "@biomejs/biome": "2.5.4",
+    "@types/node": "^24",
+    "typescript": "6.0.3"
+  }
+}
