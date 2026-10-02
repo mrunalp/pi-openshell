@@ -1,18 +1,18 @@
 # pi-openshell
 
-Run Pi Durable's coding tools in an existing OpenShell sandbox while the trusted
-harness, model client, and durable storage stay outside it.
+Run a trusted Pi Durable harness on the host with separate OpenShell sandboxes
+for coding tools and model HTTP requests. Durable storage stays on the host.
 
 Model HTTP requests can also run through a sandbox helper. An attached OpenShell
 provider supplies an opaque credential placeholder; OpenShell substitutes the
 real API key at the profile-authorized endpoint. The Pi process needs no model
 API key.
 
-This first version implements Pi Durable 1.0.0's complete `ExecutionEnv`
-interface and a conversation-to-sandbox document resolver. Sandbox provisioning,
-automatic cleanup of sandboxes, execution reattachment, and an interactive Pi
-coding-agent extension are follow-up work. This is a Durable application package;
-it does not currently register an extension through `pi install`.
+This version implements Pi Durable 1.0.0's complete `ExecutionEnv`, a conversation
+document resolver, OpenAI Responses transport, and operator-side deployment
+helpers. Automatic worker replacement, execution reattachment, and an interactive
+Pi coding-agent extension are follow-up work. This is a Durable application
+package; it does not currently register an extension through `pi install`.
 
 ## Architecture
 
@@ -39,54 +39,70 @@ flowchart TB
   gateway --> provider
   host <-->|"Authenticated SDK exec RPC"| gateway
 
-  subgraph managed["OpenShell managed execution"]
+  subgraph codingRuntime["OpenShell coding worker"]
     direction LR
-    enforcement["Trusted supervisor + runtime<br/>Filesystem, network and process policy"]
-    subgraph worker["Sandboxed Linux workload"]
+    codingControl["Trusted supervisor + runtime<br/>No egress in the default policy"]
+    subgraph codingWorker["Coding sandbox"]
       direction LR
-      helper["Node helpers<br/>Tool I/O + model HTTP requests"]
+      helper["Node helper<br/>ExecutionEnv operations"]
       shell["Bash + command descendants"]
       files[("Workspace + temporary files<br/>Output spills")]
       helper --> shell
       helper <--> files
       shell <--> files
     end
-    enforcement <-->|"Helper request / cancellation; streamed results"| worker
+    codingControl <-->|"Tool I/O and results"| codingWorker
   end
 
-  gateway <-->|"Managed exec session"| managed
-  provider -.->|"Attached provider"| managed
-  managed <-->|"Native model API; proxy substitutes the real key"| model
+  subgraph inferenceRuntime["OpenShell inference worker"]
+    direction LR
+    inferenceControl["Trusted supervisor + network proxy<br/>Policy checks + key substitution"]
+    subgraph inferenceWorker["Inference sandbox; no repository access"]
+      http["Node HTTP helper<br/>Opaque provider placeholder"]
+    end
+    inferenceControl <-->|"Model requests and responses"| inferenceWorker
+  end
+
+  gateway <-->|"Coding exec sessions"| codingRuntime
+  gateway <-->|"Inference exec sessions"| inferenceRuntime
+  provider -.->|"Attached only to inference"| inferenceRuntime
+  inferenceRuntime <-->|"Native model API with substituted key"| model
 
   classDef trusted fill:#e8f0fe,stroke:#3568a8,color:#172b4d;
   classDef control fill:#e8f5e9,stroke:#388e3c,color:#173c20;
   classDef sandboxed fill:#fff3e0,stroke:#d97706,color:#4a2c0b;
   class pi,storage,adapter,inference,sdk trusted;
-  class gateway,provider,enforcement control;
-  class helper,shell,files sandboxed;
+  class gateway,provider,codingControl,inferenceControl control;
+  class helper,shell,files,http sandboxed;
 ```
 
-The application attaches an existing sandbox to each conversation. The resolver
-reads that binding from `SandboxDoc`; the adapter verifies it and delegates tool
-I/O through the SDK. Helper code runs inside the workload, where OpenShell policy
-constrains filesystem access, networking, and processes. Pi, this package, and
-the SDK do not need to be installed in the workload image.
+The tool resolver reads a coding binding from `SandboxDoc`; model requests use
+the separately configured inference binding. Both go through authenticated SDK
+exec sessions. OpenShell policy enforces each worker's filesystem, network, and
+process boundary. Pi, this package, and the SDK do not need to be installed in
+either workload image.
 
 The model client, durable state, and gateway credentials remain on the host.
-Model HTTP connections originate inside the sandbox; real model credentials
+Model HTTP connections originate inside the inference sandbox; real model credentials
 remain in OpenShell's trusted components and are substituted by its network proxy.
 Host plugins and hooks remain trusted JavaScript and can use native Node APIs;
-`ExecutionEnv` confines only work routed through it. Provisioning and sandbox
-teardown belong to the application; this adapter attaches to existing sandboxes.
+`ExecutionEnv` confines only work routed through it. The operator creates and
+deletes the workers explicitly; closing the harness keeps them available for
+restart.
 
 ## Install
 
-Node.js 22.19 or later is required on the harness host. The workload image needs
-Node.js 22 or later and Bash in a Linux workload; it does not need Pi, this package,
-or the OpenShell SDK. Its filesystem policy must permit the working and temporary
+Node.js 22.19 or later is required on the harness host. Both workload images need
+Node.js 22 or later in Linux; coding also needs Bash. Neither needs Pi, this
+package, or the OpenShell SDK. The coding filesystem policy must permit the working and temporary
 directories, executable/library paths, and read access to `/proc` process metadata
 for descendant cleanup. Commands receive immediate stdin EOF through a pipe;
 the adapter does not require access to `/dev/null`.
+
+The deployment helpers use the community base image, the `sandbox` user/group,
+and `/usr/bin/node` by default. Custom images must provide that user/group and
+the configured executables. Review the policies and provider profile when
+changing images or executable paths.
 
 ```shell
 npm install git+https://github.com/mrunalp/pi-openshell.git @earendil-works/pi-durable@1.0.0 @earendil-works/pi-ai@1.0.0
@@ -168,8 +184,9 @@ const conversation = await harness.createConversation({
 See [examples/durable.mjs](examples/durable.mjs) for a complete runnable harness
 with SQLite storage, a real model provider, and the OpenShell SDK.
 
-The example uses `createOpenShellOpenAIProvider()` as described below. It does
-not read a model API key from the host.
+The example requires distinct coding and inference bindings, supplied through
+a deployment file or explicit sandbox names. It does not read a model API key
+from the host.
 
 The document uses `fork: "initial"`. A conversation fork receives no sandbox
 binding. Its tools fail without an environment until the application explicitly
@@ -188,29 +205,19 @@ an opaque placeholder. OpenShell checks network policy and credential endpoint
 binding before substituting the stored key. The bridge never retrieves a key or
 placeholder into the harness and never copies host auth headers into a request.
 
-Review [providers/openai-node.yaml](providers/openai-node.yaml) for your workload
-image, then import it and attach a provider to the existing sandbox:
+Review [providers/openai-node.yaml](providers/openai-node.yaml) for the inference
+image, then import it and create a provider on the same gateway/workspace used
+by the SDK:
 
 ```shell
 openshell profile lint -f providers/openai-node.yaml
 openshell profile import -f providers/openai-node.yaml
 openshell provider create --name pi-openai --type pi-openai-node --from-existing
-openshell sandbox provider attach worker pi-openai --wait
 ```
 
 `--from-existing` discovers the credential in the operator's setup environment.
-Once the provider is created, launch Pi without that key:
-
-```shell
-env -u OPENAI_API_KEY \
-  OPENSHELL_ENDPOINT=https://gateway.example.com \
-  OPENSHELL_SANDBOX=worker \
-  PI_MODEL=gpt-4.1-mini \
-  node examples/durable.mjs "Inspect the workspace"
-```
-
-Add the gateway token or mTLS file variables described in the live-test section
-when required. In an application, register the managed model provider:
+The deployment command below attaches it only to the inference worker. In an
+application, register the managed model provider with that worker's binding:
 
 ```js
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -218,7 +225,8 @@ import { createOpenShellOpenAIProvider } from "pi-openshell";
 
 const provider = createOpenShellOpenAIProvider({
   client: client.sandbox,
-  binding: { id: sandbox.id, name: sandbox.name, workspace: sandbox.workspace },
+  binding: inference.binding,
+  nodePath: inference.nodePath,
 });
 const models = createModels();
 models.setProvider(provider);
@@ -239,11 +247,84 @@ service. `createOpenShellFetch()` also exposes the transport directly for custom
 clients; automatic Pi provider setup currently covers OpenAI Responses only.
 
 The model provider's binding is application configuration, independent of the
-conversation's tool environment. Use a separate provider-attached sandbox for
-inference if coding commands should have no model-network access. Pass that
-sandbox's binding to the factory and keep the tool resolver binding unchanged.
-Sharing a sandbox grants model access to processes admitted by its effective
-policy; removing the real key does not prevent authorized API usage or spending.
+conversation's tool environment. An authorized harness can submit requests and
+consume model quota even though it never holds the stored key.
+
+## Deploy separate workers
+
+From this checkout, install dependencies, build the package, and set
+`OPENSHELL_ENDPOINT` plus the gateway token or mTLS file variables described in
+the live-test section. Create the provider as above, then:
+
+```shell
+export OPENSHELL_DEPLOYMENT=./deployment.json
+export OPENSHELL_INFERENCE_PROVIDER=pi-openai
+npm run deploy:create
+
+env -u OPENAI_API_KEY PI_MODEL=gpt-4.1-mini \
+  node examples/durable.mjs "Inspect the workspace"
+```
+
+The setup command creates two workers and waits for both to become ready:
+
+| Worker | Filesystem | Network and credentials |
+|---|---|---|
+| Coding | Writable `/sandbox/work` and `/tmp`; process metadata for command cleanup | No providers attached and no network grants by default |
+| Inference | Runtime/library/CA paths and writable `/tmp`; `/sandbox` excluded | Only the supplied provider is attached; its profile supplies endpoint policy and credential binding |
+
+The policies are in [policies/coding.json](policies/coding.json) and
+[policies/inference.json](policies/inference.json), expressed as SDK policy
+objects. Review them before provisioning. Add required build/dependency endpoints
+to the coding policy explicitly, keeping inference credentials on the inference
+worker. The inference image receives no repository mount. Inspect the effective
+policies, including any gateway-global overrides, with `openshell policy get
+<name> --full`.
+
+`deployment.json` records worker UUIDs, names, workspaces, executable paths, and
+the coding directory. It contains no credentials and is ignored by git. Setup
+refuses to overwrite an existing deployment file. Restart the harness with the
+same file and `PI_STORAGE`; startup validates both UUIDs and never falls back to
+the coding worker for inference. Missing, replaced, or shared workers are errors.
+The conversation's saved coding binding also prevents accidental workspace
+rebinding when reopening its durable store.
+
+Optional setup variables are `OPENSHELL_WORKSPACE`, `OPENSHELL_SANDBOX` and
+`OPENSHELL_INFERENCE_SANDBOX` for worker names, `OPENSHELL_CODING_IMAGE` and
+`OPENSHELL_INFERENCE_IMAGE` for images, and `OPENSHELL_NODE_PATH` and
+`OPENSHELL_INFERENCE_NODE_PATH` for Node paths. Both provisioned workers use the
+selected workspace. Closing Pi keeps the workers running; to remove them after
+stopping the harness:
+
+```shell
+npm run deploy:delete
+```
+
+Teardown validates the recorded UUIDs, removes both workers and the deployment
+file, and retains the provider and Pi's durable store. Provisioning failures
+attempt to roll back workers created by that invocation. A lost create response
+or process crash can leave resources; inspect the `pi-openshell.deployment` and
+`pi-openshell.role` labels before manual cleanup. Do not automatically retry
+uncertain provisioning outcomes.
+
+For existing workers, attach the provider only to the inference sandbox and
+provide both names instead of `OPENSHELL_DEPLOYMENT`:
+
+```shell
+openshell sandbox provider attach inference-worker pi-openai --wait
+env -u OPENAI_API_KEY \
+  OPENSHELL_SANDBOX=coding-worker \
+  OPENSHELL_INFERENCE_SANDBOX=inference-worker \
+  PI_MODEL=gpt-4.1-mini \
+  node examples/durable.mjs "Inspect the workspace"
+```
+
+Unset `OPENSHELL_DEPLOYMENT` for name-based configuration. It also supports
+`OPENSHELL_INFERENCE_WORKSPACE` (default: coding workspace) and `OPENSHELL_CWD`
+(default: `/sandbox/work`). Existing workers must have the required policies,
+executables, and coding directory already configured. Use a saved deployment
+file when you need UUID-pinned restart configuration. In an installed package,
+the operator helpers are under `node_modules/pi-openshell/examples/` and can be
+invoked with `node` directly.
 
 ## Execution and recovery
 
@@ -298,9 +379,11 @@ provider and effective network policy. Other host model clients retain their
 own inference configuration and can bypass this integration.
 
 The adapter checks the bound sandbox UUID, name, and workspace before every
-operation. Current public exec targets a sandbox by name, so this check is not
-atomic with execution. Do not delete and reuse a bound name while a harness is
-active. A server-side expected-UUID precondition is required to remove this race.
+operation. The deployment helper also verifies both UUIDs before teardown.
+Current public exec and SDK deletion target sandboxes by name, so these checks
+are not atomic with the operation. Do not delete and reuse a bound name while a
+harness or deployment command is active. Server-side expected-UUID preconditions
+are required to remove this race.
 
 ## Develop and verify
 
@@ -339,26 +422,28 @@ checks that an unbound conversation fork cannot modify the assigned sandbox.
 Each tool test uses a unique temporary directory in the sandbox and removes that
 directory afterward. The tests do not create or delete sandboxes.
 
-For provider injection, use a local gateway reachable from this machine's
+For the complete deployment, use a local gateway reachable from this machine's
 `host.openshell.internal` address. From this source checkout, with the same
 gateway/TLS variables set, run:
 
 ```shell
-npm run test:provider:live
+npm run test:deployment:live
 ```
 
 This separate test creates a temporary profile, provider with a synthetic key,
-and sandbox. A host-local mock Responses API verifies the substituted key while
-Pi's real OpenAI client streams its response. It also checks that the workload
-receives a placeholder and provider detachment blocks the next call. The test
-removes those resources afterward. It uses local HTTP and no paid model service;
+and two workers using the same deployment helper as setup. It verifies coding
+network denial and absent model credentials, inference filesystem isolation,
+placeholder substitution, and a Pi Durable model-driven read/write/edit/bash
+sequence. Provider detachment blocks the next call. The test removes those
+resources afterward. `test:provider:live` remains an alias. It uses a host-local
+mock Responses API over HTTP and no paid model service;
 the caller needs permission to manage profiles, providers, and sandboxes.
 
 Locally verified on October 1, 2026 with Pi Durable 1.0.0, the TypeScript SDK and
 gateway/runtime/supervisor built from OpenShell commit `76cfd0e31d5e`, rootless
-Podman, mTLS, and the community base workload image with Node 22.22.1. An explicit
-policy granted filesystem access and `/proc` metadata, with no network grants.
-Tool tests used a deterministic model. The provider test additionally verified
-real OpenShell substitution against the local mock Responses API, with Pi's real
-OpenAI client. Paid provider calls, external upstream TLS, and crash recovery were
+Podman, mTLS, and the community base workload image with Node 22.22.1. Tool-only
+tests used a deterministic model. The two-worker test verified the default
+deployment policies and real OpenShell substitution against the local mock
+Responses API, with Pi's real OpenAI client and Durable harness. Paid provider
+calls, external upstream TLS, and crash recovery were
 not exercised.

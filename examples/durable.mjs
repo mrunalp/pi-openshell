@@ -4,14 +4,19 @@ import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
 import { createOpenShellEnvResolver, createOpenShellOpenAIProvider, SandboxDoc } from "../dist/index.js";
-import { connect } from "./connect.mjs";
+import { connectManaged } from "./connect.mjs";
 
 const context = BACKGROUND_CONTEXT;
-const { client, binding, cwd, nodePath } = await connect();
+const { client, coding, inference } = await connectManaged();
+const { binding, cwd, nodePath } = coding;
 const modelId = process.env.PI_MODEL;
 if (!modelId) throw new Error("Set PI_MODEL to an OpenAI model ID and attach an OpenShell model provider");
 const models = createModels();
-const provider = createOpenShellOpenAIProvider({ client: client.sandbox, binding, nodePath });
+const provider = createOpenShellOpenAIProvider({
+  client: client.sandbox,
+  binding: inference.binding,
+  nodePath: inference.nodePath,
+});
 models.setProvider(provider);
 const registry = createRegistry();
 registry.install(CodingTools);

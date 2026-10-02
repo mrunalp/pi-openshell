@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { OpenShellClient } from "@nvidia/openshell-sdk";
+import { resolveDeployment } from "./deployment.mjs";
 
 async function pem(variable) {
   const path = process.env[variable];
@@ -29,4 +30,36 @@ export async function connect() {
     cwd: process.env.OPENSHELL_CWD ?? "/sandbox/work",
     nodePath: process.env.OPENSHELL_NODE_PATH ?? "/usr/bin/node",
   };
+}
+
+export async function connectManaged() {
+  const client = await connectGateway();
+  const path = process.env.OPENSHELL_DEPLOYMENT;
+  let deployment;
+  if (path) deployment = JSON.parse(await readFile(path, "utf8"));
+  else {
+    const codingName = process.env.OPENSHELL_SANDBOX;
+    const inferenceName = process.env.OPENSHELL_INFERENCE_SANDBOX;
+    if (!codingName || !inferenceName)
+      throw new Error("Set OPENSHELL_DEPLOYMENT or both OPENSHELL_SANDBOX and OPENSHELL_INFERENCE_SANDBOX");
+    const codingWorkspace = process.env.OPENSHELL_WORKSPACE ?? "default";
+    const inferenceWorkspace = process.env.OPENSHELL_INFERENCE_WORKSPACE ?? codingWorkspace;
+    const coding = await client.sandbox.get(codingName, { workspace: codingWorkspace });
+    const inference = await client.sandbox.get(inferenceName, { workspace: inferenceWorkspace });
+    deployment = {
+      version: 1,
+      id: "application-configured",
+      coding: {
+        binding: { id: coding.id, name: coding.name, workspace: coding.workspace },
+        cwd: process.env.OPENSHELL_CWD ?? "/sandbox/work",
+        nodePath: process.env.OPENSHELL_NODE_PATH ?? "/usr/bin/node",
+      },
+      inference: {
+        binding: { id: inference.id, name: inference.name, workspace: inference.workspace },
+        nodePath: process.env.OPENSHELL_INFERENCE_NODE_PATH ?? "/usr/bin/node",
+        provider: process.env.OPENSHELL_INFERENCE_PROVIDER ?? "application-attached",
+      },
+    };
+  }
+  return { client, ...(await resolveDeployment(client.sandbox, deployment)) };
 }

@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "filesystem": {
+    "includeWorkdir": false,
+    "readOnly": ["/usr", "/lib", "/lib64", "/bin", "/etc"],
+    "readWrite": ["/tmp"]
+  },
+  "landlock": { "compatibility": "hard_requirement" },
+  "process": { "runAsUser": "sandbox", "runAsGroup": "sandbox" }
+}
