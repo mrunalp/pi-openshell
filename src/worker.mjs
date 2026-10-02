@@ -401,11 +401,68 @@ function input() {
   };
 }
 
+async function http(request, signal) {
+  const url = new URL(request.url);
+  const endpoint = new URL(request.baseUrl);
+  const prefix = endpoint.pathname.replace(/\/$/, "");
+  if (
+    url.origin !== endpoint.origin ||
+    (url.pathname !== prefix && !url.pathname.startsWith(`${prefix}/`)) ||
+    url.username ||
+    url.password ||
+    url.hash ||
+    (url.protocol !== "https:" && !(request.allowHttp && url.protocol === "http:"))
+  )
+    throw failure("invalid", "Model request is outside the configured provider endpoint");
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(request.credentialEnv))
+    throw failure("invalid", "Invalid provider credential environment name");
+  const placeholder = process.env[request.credentialEnv];
+  if (!placeholder) throw failure("provider_missing", "Attach the model provider before launching requests");
+  const headers = new Headers(request.headers);
+  for (const name of [
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+    "host",
+    "content-length",
+  ])
+    headers.delete(name);
+  headers.set("authorization", `Bearer ${placeholder}`);
+  const body = request.body === null ? undefined : Buffer.from(request.body, "base64");
+  if (body && body.length > request.limits.maxFileBytes)
+    throw failure("invalid", "Model request body exceeds byte limit");
+  const response = await fetch(url, { method: request.method, headers, body, redirect: "manual", signal });
+  await emit({
+    type: "http-response",
+    status: response.status,
+    statusText: response.statusText,
+    headers: [...response.headers],
+  });
+  if (response.body) {
+    try {
+      for await (const chunk of response.body) {
+        for (let offset = 0; offset < chunk.length; offset += 64 * 1024)
+          await emit({
+            type: "output",
+            stream: "stdout",
+            data: Buffer.from(chunk.subarray(offset, offset + 64 * 1024)).toString("base64"),
+          });
+      }
+    } finally {
+      await response.body.cancel().catch(() => {});
+    }
+  }
+  await emit({ type: "result", value: null });
+}
+
 async function main(channel) {
   const request = await channel.request;
   if (request.version !== 1 || !request.limits || !request.cwd?.startsWith("/"))
     throw failure("invalid", "Invalid worker request");
   if (request.op === "lines") return lines(request);
+  if (request.op === "http") return http(request, channel.signal);
   const value = request.op === "shell" ? await shell(request, channel.signal) : await filesystem(request);
   await emit({ type: "result", value });
 }

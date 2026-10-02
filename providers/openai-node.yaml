@@ -1,0 +1,26 @@
+# Review the executable paths for your workload image before importing.
+# This profile grants OpenAI Responses access to the adapter's Node helpers.
+id: pi-openai-node
+display_name: Pi OpenAI Responses
+description: OpenAI Responses access for sandboxed pi-openshell HTTP helpers
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OpenAI API key
+    env_vars: [OPENAI_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.openai.com
+    port: 443
+    path: /v1/responses/**
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/node
+  - /usr/local/bin/node

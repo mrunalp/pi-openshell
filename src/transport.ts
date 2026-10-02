@@ -132,7 +132,7 @@ export class OpenShellTransport {
     workerSource ??= readFile(new URL("./worker.mjs", import.meta.url), "utf8");
     const source = await workerSource;
     signal?.throwIfAborted();
-    const controlledShell = request.op === "shell";
+    const controlledShell = request.op === "shell" || request.op === "http";
     const rpcController = new AbortController();
     const launchAbort = () => rpcController.abort();
     signal?.addEventListener("abort", launchAbort, { once: true });

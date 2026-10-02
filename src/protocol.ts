@@ -7,6 +7,7 @@ export interface WorkerError {
 
 export type Frame =
   | { version: 1; type: "ready" }
+  | { version: 1; type: "http-response"; status: number; statusText: string; headers: [string, string][] }
   | { version: 1; type: "line"; data: string; terminated: boolean }
   | { version: 1; type: "output"; stream: "stdout" | "stderr"; data: string }
   | { version: 1; type: "spill"; path: string }
@@ -31,6 +32,20 @@ export function parseFrame(text: string): Frame {
   if (!record(value) || value.version !== 1) throw new Error("Invalid worker protocol version");
   switch (value.type) {
     case "ready":
+      break;
+    case "http-response":
+      if (
+        !Number.isInteger(value.status) ||
+        (value.status as number) < 200 ||
+        (value.status as number) > 599 ||
+        typeof value.statusText !== "string" ||
+        !Array.isArray(value.headers) ||
+        !value.headers.every(
+          (entry) =>
+            Array.isArray(entry) && entry.length === 2 && entry.every((part) => typeof part === "string"),
+        )
+      )
+        throw new Error("Invalid worker HTTP response");
       break;
     case "line":
       decodeBase64(value.data);

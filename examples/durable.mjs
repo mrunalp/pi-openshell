@@ -1,18 +1,18 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
-import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { CodingTools } from "@earendil-works/pi-durable/tools";
-import { createOpenShellEnvResolver, SandboxDoc } from "../dist/index.js";
+import { createOpenShellEnvResolver, createOpenShellOpenAIProvider, SandboxDoc } from "../dist/index.js";
 import { connect } from "./connect.mjs";
 
 const context = BACKGROUND_CONTEXT;
 const { client, binding, cwd, nodePath } = await connect();
 const modelId = process.env.PI_MODEL;
-if (!modelId) throw new Error("Set PI_MODEL to an OpenAI model ID; OPENAI_API_KEY stays on the harness host");
+if (!modelId) throw new Error("Set PI_MODEL to an OpenAI model ID and attach an OpenShell model provider");
 const models = createModels();
-models.setProvider(openaiProvider());
+const provider = createOpenShellOpenAIProvider({ client: client.sandbox, binding, nodePath });
+models.setProvider(provider);
 const registry = createRegistry();
 registry.install(CodingTools);
 const harness = await Harness.open(
@@ -53,5 +53,9 @@ try {
     await watch.stop();
   }
 } finally {
-  await harness.close(context);
+  try {
+    await harness.close(context);
+  } finally {
+    await provider.cleanup();
+  }
 }

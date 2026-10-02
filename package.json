@@ -26,7 +26,8 @@
     "dist",
     "README.md",
     "LICENSE",
-    "examples"
+    "examples",
+    "providers"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node scripts/copy-worker.mjs",
@@ -34,10 +35,12 @@
     "lint": "biome check .",
     "test": "npm run build && node --test --test-timeout=30000 test/*.test.mjs",
     "test:live": "node examples/smoke.mjs && node examples/durable-smoke.mjs",
+    "test:provider:live": "npm run build && node test/live-provider.mjs",
     "check": "npm run typecheck && npm run lint && npm test",
     "prepare": "npm run build"
   },
   "peerDependencies": {
+    "@earendil-works/pi-ai": "1.0.0",
     "@earendil-works/pi-durable": "1.0.0",
     "@nvidia/openshell-sdk": ">=0.0.0 <1.0.0"
   },
