@@ -1,5 +1,7 @@
 # pi-openshell
 
+## Note: This is an experimental exploration of potential pi and OpenShell integration patterns
+
 Run a trusted Pi Durable harness on the host with separate OpenShell sandboxes
 for coding tools and model HTTP requests. Durable storage stays on the host.
 
