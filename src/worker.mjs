@@ -3,7 +3,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { createReadStream } from "node:fs";
+import { createReadStream, readdirSync, readFileSync } from "node:fs";
 import {
   appendFile,
   lstat,
@@ -170,7 +170,7 @@ async function filesystem(request) {
   }
 }
 
-async function shell(request) {
+async function shell(request, controlSignal) {
   const options = request.options;
   let child;
   let timedOut = false;
@@ -183,13 +183,58 @@ async function shell(request) {
   const prefixChunks = [];
   let pending = Promise.resolve();
   let pendingCount = 0;
+  let groupBirth;
+  const proc = (pid) => {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat
+        .slice(stat.lastIndexOf(")") + 2)
+        .trim()
+        .split(/\s+/);
+      return { group: Number(fields[2]), birth: BigInt(fields[19]) };
+    } catch (error) {
+      if (["ENOENT", "ESRCH", "EACCES"].includes(error.code)) return undefined;
+      throw error;
+    }
+  };
+  const signalMember = (pid, signal) => {
+    const identity = proc(pid);
+    if (!identity || identity.group !== child.pid || identity.birth < groupBirth) return;
+    try {
+      process.kill(pid, signal);
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  };
   const killTree = () => {
     if (!child?.pid) return;
     try {
       process.kill(-child.pid, "SIGKILL");
+      return;
     } catch (error) {
-      if (error.code !== "ESRCH") child.kill("SIGKILL");
+      if (error.code === "ESRCH") return;
+      if (error.code !== "EPERM") throw error;
     }
+    // OpenShell denies group/broadcast signals. Freeze and then kill members
+    // individually through its broker. A live PGID cannot be reused; reject a
+    // replacement leader and processes born before this shell's identity.
+    const leader = proc(child.pid);
+    if (groupBirth === undefined || (leader && leader.birth !== groupBirth)) return;
+    const members = new Set();
+    for (let pass = 0; pass < 8; pass++) {
+      const previous = members.size;
+      for (const entry of readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        const pid = Number(entry);
+        const identity = proc(pid);
+        if (identity?.group !== child.pid || identity.birth < groupBirth) continue;
+        signalMember(pid, "SIGSTOP");
+        members.add(pid);
+      }
+      if (members.size === previous) break;
+    }
+    for (const pid of members) if (pid !== child.pid) signalMember(pid, "SIGKILL");
+    if (members.has(child.pid)) signalMember(child.pid, "SIGKILL");
   };
   const abort = () => {
     aborted = true;
@@ -197,20 +242,32 @@ async function shell(request) {
   };
   const signals = ["SIGTERM", "SIGINT", "SIGHUP"];
   for (const signal of signals) process.on(signal, abort);
+  controlSignal.addEventListener("abort", abort, { once: true });
   let timer;
   try {
+    if (controlSignal.aborted) throw failure("aborted", "Command aborted");
+    // Process metadata is required for the broker's positive-PID signal path.
+    readdirSync("/proc");
+    if (!proc(process.pid))
+      throw failure("not_supported", "Shell cleanup requires readable /proc process metadata");
     const environment = options.inheritEnv === false ? {} : { ...process.env };
     // Extra variables are applied only to the child, never the harness process.
     child = spawn(request.shellPath, ["--noprofile", "--norc", "-c", request.command], {
       cwd: request.cwd,
       env: { ...environment, ...options.env },
       detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.once("spawn", () => {
+      groupBirth = proc(child.pid)?.birth;
     });
     const closed = new Promise((resolveClose, rejectClose) => {
       child.once("error", rejectClose);
       child.once("close", (code, signal) => resolveClose({ code, signal }));
     });
+    // Give commands immediate EOF without opening /dev/null. A sandbox policy
+    // may deny that device even though it permits the shell and working files.
+    child.stdin.end();
     // Stop ordinary descendants in the shell's group. Deliberately detached
     // groups remain subject to the sandbox's outer lifecycle and policy.
     child.once("exit", killTree);
@@ -280,29 +337,84 @@ async function shell(request) {
   } finally {
     clearTimeout(timer);
     for (const signal of signals) process.off(signal, abort);
+    controlSignal.removeEventListener("abort", abort);
     await pending;
     await spillFile?.close();
   }
 }
 
-async function main() {
+function input() {
   const chunks = [];
   let size = 0;
-  for await (const chunk of process.stdin) {
-    size += chunk.length;
-    if (size > MAX_REQUEST_BYTES) throw failure("invalid", "Worker request exceeds byte limit");
-    chunks.push(chunk);
-  }
-  const request = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  let received = false;
+  const controller = new AbortController();
+  let resolveRequest;
+  let rejectRequest;
+  const request = new Promise((resolve, reject) => {
+    resolveRequest = resolve;
+    rejectRequest = reject;
+  });
+  const onData = (chunk) => {
+    if (received) {
+      // Any further input is a cancellation request. Only the trusted adapter
+      // owns this input stream; there is no command or PID in the control frame.
+      controller.abort();
+      return;
+    }
+    const newline = chunk.indexOf(10);
+    const part = newline < 0 ? chunk : chunk.subarray(0, newline);
+    size += part.length;
+    if (size > MAX_REQUEST_BYTES) {
+      rejectRequest(failure("invalid", "Worker request exceeds byte limit"));
+      return;
+    }
+    chunks.push(part);
+    if (newline < 0) return;
+    received = true;
+    try {
+      resolveRequest(JSON.parse(Buffer.concat(chunks, size).toString("utf8")));
+    } catch (error) {
+      rejectRequest(error);
+    }
+    if (newline + 1 < chunk.length) controller.abort();
+  };
+  const onEnd = () => {
+    if (!received) rejectRequest(failure("invalid", "Incomplete worker request"));
+    controller.abort();
+  };
+  const onError = (error) => {
+    rejectRequest(error);
+    controller.abort();
+  };
+  process.stdin.on("data", onData);
+  process.stdin.on("end", onEnd);
+  process.stdin.on("error", onError);
+  return {
+    request,
+    signal: controller.signal,
+    close() {
+      process.stdin.off("data", onData);
+      process.stdin.off("end", onEnd);
+      process.stdin.off("error", onError);
+      process.stdin.destroy();
+    },
+  };
+}
+
+async function main(channel) {
+  const request = await channel.request;
   if (request.version !== 1 || !request.limits || !request.cwd?.startsWith("/"))
     throw failure("invalid", "Invalid worker request");
   if (request.op === "lines") return lines(request);
-  const value = request.op === "shell" ? await shell(request) : await filesystem(request);
+  const value = request.op === "shell" ? await shell(request, channel.signal) : await filesystem(request);
   await emit({ type: "result", value });
 }
 
+const channel = input();
 try {
-  await main();
+  await main(channel);
 } catch (error) {
   await emit({ type: "error", error: serializeError(error) });
+} finally {
+  channel.close();
 }

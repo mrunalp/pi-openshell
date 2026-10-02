@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "test": "npm run build && node --test --test-timeout=30000 test/*.test.mjs",
+    "test:live": "node examples/smoke.mjs && node examples/durable-smoke.mjs",
     "check": "npm run typecheck && npm run lint && npm test",
     "prepare": "npm run build"
   },

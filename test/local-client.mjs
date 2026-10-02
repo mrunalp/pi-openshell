@@ -5,6 +5,7 @@ import { Readable } from "node:stream";
 export class LocalSandboxClient {
   executions = [];
   children = new Set();
+  denyGroupSignals = false;
   constructor(binding, environment = {}) {
     this.binding = binding;
     this.environment = environment;
@@ -20,7 +21,15 @@ export class LocalSandboxClient {
   async execInteractive(name, command, options) {
     options?.signal?.throwIfAborted();
     this.executions.push({ name, command, options });
-    const child = spawn(command[0], command.slice(1), {
+    const args = command.slice(1);
+    if (this.denyGroupSignals) {
+      args[args.length - 1] = `const kill = process.kill.bind(process);
+        process.kill = (pid, signal) => {
+          if (pid <= 0) throw Object.assign(new Error("group signals denied"), {code:"EPERM"});
+          return kill(pid, signal);
+        };\n${args[args.length - 1]}`;
+    }
+    const child = spawn(command[0], args, {
       cwd: options.workdir,
       env: { PATH: "/usr/bin:/bin", ...this.environment },
       detached: true,
@@ -49,7 +58,7 @@ export class LocalSandboxClient {
     const cancel = () => {
       if (cancelled) return;
       cancelled = true;
-      // Match gateway exec cancellation: terminate the helper's process group.
+      // Test transport cancellation terminates the helper's process group.
       try {
         process.kill(-child.pid, "SIGTERM");
       } catch {}

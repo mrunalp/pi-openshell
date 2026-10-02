@@ -246,6 +246,30 @@ test("callback errors terminate remote execution", async (t) => {
   assert.equal(value(await env.exists("callback-leak", context)), false);
 });
 
+test("descendant cleanup works when the sandbox denies group signals", async (t) => {
+  const { env, client } = await fixture(t);
+  client.denyGroupSignals = true;
+  const result = await env.exec("(sleep 1; touch broker-leak) & wait", { timeout: 0.1 }, context);
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "timeout");
+  await delay(1100);
+  assert.equal(value(await env.exists("broker-leak", context)), false);
+});
+
+test("shell stdin receives EOF without inheriting the worker request", async (t) => {
+  const { env } = await fixture(t);
+  const output = [];
+  const result = value(
+    await env.exec(
+      "if IFS= read -r line; then exit 1; else printf eof; fi",
+      { timeout: 5, onOutput: (text) => output.push(text) },
+      context,
+    ),
+  );
+  assert.equal(result.exitCode, 0);
+  assert.equal(output.join(""), "eof");
+});
+
 test("a stale sandbox binding never launches a helper", async (t) => {
   const { env, client } = await fixture(t);
   client.binding = { ...client.binding, id: "replacement" };

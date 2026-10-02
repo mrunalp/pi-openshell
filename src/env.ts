@@ -97,7 +97,7 @@ function fileInfo(value: unknown): FileInfo {
 interface Operation {
   stream: WorkerStream;
   controller: AbortController;
-  finish(): void;
+  finish(): Promise<void>;
 }
 
 class RemoteLineReader implements TextLineReader {
@@ -128,7 +128,7 @@ class RemoteLineReader implements TextLineReader {
         throw new Error("Invalid line reader response");
       if (!(await this.operation.stream.next()).done) throw new Error("Line reader sent output after EOF");
       this.ended = true;
-      this.operation.finish();
+      await this.operation.finish();
       return ok(undefined);
     } catch (error) {
       await this.close(context);
@@ -141,7 +141,7 @@ class RemoteLineReader implements TextLineReader {
   async close(_context: Context): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    this.operation.finish();
+    await this.operation.finish();
   }
 }
 
@@ -191,11 +191,11 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
         : AbortSignal.any([controller.signal, context.abortSignal]);
     const timer = deadline ? setTimeout(() => controller.abort(), this.fileTimeoutMs) : undefined;
     let stream: WorkerStream | undefined;
-    const finish = () => {
+    const finish = async () => {
       clearTimeout(timer);
       this.controllers.delete(controller);
       controller.abort();
-      stream?.cancel();
+      await stream?.cancel();
     };
     try {
       stream = await this.transport.start(
@@ -204,7 +204,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
       );
       return { stream, controller, finish };
     } catch (error) {
-      finish();
+      await finish();
       throw error;
     }
   }
@@ -232,7 +232,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
     } catch (error) {
       return err(fileError(error, path, context.abortSignal?.aborted));
     } finally {
-      operation?.finish();
+      await operation?.finish();
     }
   }
 
@@ -278,7 +278,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
       if (next.value.type !== "ready") throw new Error("Invalid line reader handshake");
       return ok(new RemoteLineReader(operation, path));
     } catch (error) {
-      operation?.finish();
+      await operation?.finish();
       return err(fileError(error, path, context.abortSignal?.aborted));
     }
   }
@@ -434,12 +434,13 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
         context,
       );
       const output = (text: string) => {
-        if (text === "" || options?.onOutput === undefined) return;
+        if (text === "" || options?.onOutput === undefined || callbackError || context.abortSignal?.aborted)
+          return;
         try {
           options.onOutput(text, context);
         } catch (error) {
           callbackError = error instanceof Error ? error : new Error(String(error));
-          throw callbackError;
+          operation?.controller.abort();
         }
       };
       let result: ShellExecResult | undefined;
@@ -479,6 +480,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
       }
       output(decoders.stdout.decode());
       output(decoders.stderr.decode());
+      if (callbackError !== undefined) throw callbackError;
       if (remoteError !== undefined) throw remoteError;
       if (result === undefined) throw new Error("Shell execution ended without a result");
       return ok(result);
@@ -499,12 +501,13 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
       failure.spillPath = remote?.spillPath ?? spillPath;
       return err(failure);
     } finally {
-      operation?.finish();
+      await operation?.finish();
     }
   }
 
   async cleanup(_context: Context): Promise<void> {
     for (const controller of this.controllers) controller.abort();
+    await this.transport.cleanup();
     this.controllers.clear();
   }
 }
