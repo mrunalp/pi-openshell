@@ -9,6 +9,63 @@ automatic cleanup of sandboxes, execution reattachment, and an interactive Pi
 coding-agent extension are follow-up work. This is a Durable application package;
 it does not currently register an extension through `pi install`.
 
+## Architecture
+
+```mermaid
+flowchart TB
+  subgraph host["Trusted harness host"]
+    direction LR
+    pi["Pi Durable harness + CodingTools<br/>Operator-approved plugins and hooks"]
+    storage[("Durable storage<br/>Conversation + SandboxDoc")]
+    adapter["pi-openshell<br/>Env resolver + ExecutionEnv"]
+    sdk["OpenShell TypeScript SDK<br/>Gateway credentials"]
+    pi <--> storage
+    pi -->|"read / write / edit / bash"| adapter
+    storage -.->|"workspace, name, UUID, cwd"| adapter
+    adapter --> sdk
+  end
+
+  model["Model provider"]
+  gateway["OpenShell gateway<br/>Authentication + sandbox lifecycle"]
+  host <-->|"Harness model client"| model
+  host <-->|"Authenticated SDK exec RPC"| gateway
+
+  subgraph managed["OpenShell managed execution"]
+    direction LR
+    enforcement["Trusted supervisor + runtime<br/>Filesystem, network and process policy"]
+    subgraph worker["Sandboxed Linux workload"]
+      direction LR
+      helper["Node helper<br/>One per ExecutionEnv operation"]
+      shell["Bash + command descendants"]
+      files[("Workspace + temporary files<br/>Output spills")]
+      helper --> shell
+      helper <--> files
+      shell <--> files
+    end
+    enforcement <-->|"Helper request / cancellation; streamed results"| worker
+  end
+
+  gateway <-->|"Managed exec session"| managed
+
+  classDef trusted fill:#e8f0fe,stroke:#3568a8,color:#172b4d;
+  classDef control fill:#e8f5e9,stroke:#388e3c,color:#173c20;
+  classDef sandboxed fill:#fff3e0,stroke:#d97706,color:#4a2c0b;
+  class pi,storage,adapter,sdk trusted;
+  class gateway,enforcement control;
+  class helper,shell,files sandboxed;
+```
+
+The application attaches an existing sandbox to each conversation. The resolver
+reads that binding from `SandboxDoc`; the adapter verifies it and delegates tool
+I/O through the SDK. Helper code runs inside the workload, where OpenShell policy
+constrains filesystem access, networking, and processes. Pi, this package, and
+the SDK do not need to be installed in the workload image.
+
+Model calls, durable state, and gateway credentials remain outside the worker.
+Host plugins and hooks remain trusted JavaScript and can use native Node APIs;
+`ExecutionEnv` confines only work routed through it. Provisioning and sandbox
+teardown belong to the application; this adapter attaches to existing sandboxes.
+
 ## Install
 
 Node.js 22.19 or later is required on the harness host. The workload image needs
