@@ -1,5 +1,7 @@
 // This module is sent through gateway exec and runs only inside the sandbox.
-// It imports no Pi or OpenShell packages and never resolves a harness-host path.
+// Pi's filesystem helpers are bundled at build time; no packages are needed in
+// the sandbox, and this module never resolves a harness-host path.
+
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
@@ -18,6 +20,7 @@ import {
 } from "node:fs/promises";
 import { constants } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 
 const MAX_REQUEST_BYTES = 96 * 1024 * 1024;
 
@@ -252,12 +255,17 @@ async function shell(request, controlSignal) {
       throw failure("not_supported", "Shell cleanup requires readable /proc process metadata");
     const environment = options.inheritEnv === false ? {} : { ...process.env };
     // Extra variables are applied only to the child, never the harness process.
-    child = spawn(request.shellPath, ["--noprofile", "--norc", "-c", request.command], {
-      cwd: request.cwd,
-      env: { ...environment, ...options.env },
-      detached: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    const argv = Array.isArray(request.command);
+    child = spawn(
+      argv ? request.command[0] : request.shellPath,
+      argv ? request.command.slice(1) : ["--noprofile", "--norc", "-c", request.command],
+      {
+        cwd: request.cwd,
+        env: { ...environment, ...options.env },
+        detached: true,
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
     child.once("spawn", () => {
       groupBirth = proc(child.pid)?.birth;
     });
@@ -350,15 +358,37 @@ function input() {
   const controller = new AbortController();
   let resolveRequest;
   let rejectRequest;
+  const commands = [];
+  let wake;
+  let control = "";
   const request = new Promise((resolve, reject) => {
     resolveRequest = resolve;
     rejectRequest = reject;
   });
+  const receiveControl = (chunk) => {
+    control += chunk.toString("utf8");
+    if (Buffer.byteLength(control) > MAX_REQUEST_BYTES) {
+      controller.abort();
+      return;
+    }
+    let newline;
+    while ((newline = control.indexOf("\n")) !== -1) {
+      const text = control.slice(0, newline);
+      control = control.slice(newline + 1);
+      try {
+        const command = JSON.parse(text);
+        if (command.type === "cancel") controller.abort();
+        else commands.push(command);
+      } catch {
+        controller.abort();
+      }
+      wake?.();
+    }
+  };
+  controller.signal.addEventListener("abort", () => wake?.(), { once: true });
   const onData = (chunk) => {
     if (received) {
-      // Any further input is a cancellation request. Only the trusted adapter
-      // owns this input stream; there is no command or PID in the control frame.
-      controller.abort();
+      receiveControl(chunk);
       return;
     }
     const newline = chunk.indexOf(10);
@@ -376,7 +406,7 @@ function input() {
     } catch (error) {
       rejectRequest(error);
     }
-    if (newline + 1 < chunk.length) controller.abort();
+    if (newline + 1 < chunk.length) receiveControl(chunk.subarray(newline + 1));
   };
   const onEnd = () => {
     if (!received) rejectRequest(failure("invalid", "Incomplete worker request"));
@@ -392,6 +422,15 @@ function input() {
   return {
     request,
     signal: controller.signal,
+    async nextCommand() {
+      while (!commands.length && !controller.signal.aborted)
+        await new Promise((resolve) => {
+          wake = resolve;
+        });
+      wake = undefined;
+      controller.signal.throwIfAborted();
+      return commands.shift();
+    },
     close() {
       process.stdin.off("data", onData);
       process.stdin.off("end", onEnd);
@@ -399,6 +438,97 @@ function input() {
       process.stdin.destroy();
     },
   };
+}
+
+async function reader(request, channel) {
+  const env = new NodeExecutionEnv({ cwd: request.cwd });
+  const context = { abortSignal: channel.signal };
+  const path = resolve(request.cwd, request.path);
+  const opened =
+    request.op === "binary-reader"
+      ? await env.openBinaryReader(path, request.options, context)
+      : await env.openDirReader(path, context);
+  if (!opened.ok) throw opened.error;
+  const handle = opened.value;
+  try {
+    await emit({ type: "ready" });
+    for (;;) {
+      const command = await channel.nextCommand();
+      if (command.type === "close") break;
+      let result;
+      switch (command.type) {
+        case "info":
+          result = await handle.info(context);
+          break;
+        case "read":
+          if (
+            !Number.isSafeInteger(command.length) ||
+            command.length < 0 ||
+            command.length > request.limits.maxFileBytes
+          )
+            result = { ok: false, error: failure("invalid", "Read exceeds file byte limit", { path }) };
+          else {
+            result = await handle.read(command.offset, command.length, context);
+            if (result.ok) result = { ok: true, value: Buffer.from(result.value).toString("base64") };
+          }
+          break;
+        case "scan":
+          result = await handle.scanLines(command.options, context);
+          break;
+        case "next":
+          if (
+            !Number.isSafeInteger(command.maxEntries) ||
+            command.maxEntries <= 0 ||
+            command.maxEntries > request.limits.maxDirectoryEntries
+          )
+            result = { ok: false, error: failure("invalid", "Invalid directory page size", { path }) };
+          else result = await handle.next(command.maxEntries, context);
+          break;
+        default:
+          throw failure("invalid", "Unknown reader command");
+      }
+      await emit({
+        type: "reply",
+        value: result.ok ? result : { ok: false, error: serializeError(result.error) },
+      });
+    }
+    await emit({ type: "result", value: null });
+  } finally {
+    await handle.close({});
+  }
+}
+
+async function watch(request, channel) {
+  const env = new NodeExecutionEnv({
+    cwd: request.cwd,
+    watch: { maxDirectories: request.limits.maxDirectoryEntries },
+  });
+  // Changes during startup must follow the mode handshake on the wire.
+  let ready;
+  let pending = new Promise((resolve) => {
+    ready = resolve;
+  });
+  const result = await env.watch(
+    request.targets.map((target) => ({ ...target, path: resolve(request.cwd, target.path) })),
+    (change) => {
+      const value = "error" in change ? { error: serializeError(change.error) } : change;
+      pending = pending.then(() => emit({ type: "watch", value }));
+      // main() observes failures when the watcher closes.
+      void pending.catch(() => {});
+    },
+    { abortSignal: channel.signal },
+  );
+  if (!result.ok) throw result.error;
+  try {
+    await emit({ type: "reply", value: result.value.mode });
+    ready();
+    const command = await channel.nextCommand();
+    if (command.type !== "close") throw failure("invalid", "Unknown watch command");
+  } finally {
+    await result.value.close({});
+    await pending;
+  }
+  await emit({ type: "result", value: null });
 }
 
 async function http(request, signal) {
@@ -462,6 +592,8 @@ async function main(channel) {
   if (request.version !== 1 || !request.limits || !request.cwd?.startsWith("/"))
     throw failure("invalid", "Invalid worker request");
   if (request.op === "lines") return lines(request);
+  if (request.op === "binary-reader" || request.op === "dir-reader") return reader(request, channel);
+  if (request.op === "watch") return watch(request, channel);
   if (request.op === "http") return http(request, channel.signal);
   const value = request.op === "shell" ? await shell(request, channel.signal) : await filesystem(request);
   await emit({ type: "result", value });

@@ -7,6 +7,8 @@ export interface WorkerError {
 
 export type Frame =
   | { version: 1; type: "ready" }
+  | { version: 1; type: "reply"; value: unknown }
+  | { version: 1; type: "watch"; value: unknown }
   | { version: 1; type: "http-response"; status: number; statusText: string; headers: [string, string][] }
   | { version: 1; type: "line"; data: string; terminated: boolean }
   | { version: 1; type: "output"; stream: "stdout" | "stderr"; data: string }
@@ -58,6 +60,8 @@ export function parseFrame(text: string): Frame {
     case "spill":
       if (typeof value.path !== "string") throw new Error("Invalid worker spill path");
       break;
+    case "reply":
+    case "watch":
     case "result":
       if (!("value" in value)) throw new Error("Missing worker result");
       break;

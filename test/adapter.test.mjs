@@ -110,6 +110,50 @@ test("remote filesystem failures are typed and transfers are bounded", async (t)
   assert.equal((await reader.readLine(context)).error.code, "invalid");
 });
 
+test("positional readers scan large files while bounding individual transfers", async (t) => {
+  const { env } = await fixture(t, { maxFileBytes: 16 });
+  value(await env.exec("printf 'first\\nsecond\\nthird\\nfourth\\n' > large-lines", undefined, context));
+  assert.equal((await env.readBinaryFile("large-lines", context)).error.code, "invalid");
+  const reader = value(await env.openBinaryReader("large-lines", undefined, context));
+  try {
+    assert.equal(value(await reader.info(context)).size, 26);
+    assert.deepEqual(value(await reader.scanLines({ startLine: 1, endLine: 3 }, context)), {
+      newlines: 4,
+      start: 6,
+      end: 18,
+      firstLineEnd: 12,
+      lastLineStart: 13,
+      selectedBytes: 12,
+      firstLineBytes: 6,
+    });
+    assert.equal((await reader.read(0, 17, context)).error.code, "invalid");
+    const pages = await Promise.all([reader.read(6, 6, context), reader.read(13, 5, context)]);
+    assert.deepEqual(
+      pages.map((result) => Buffer.from(value(result)).toString()),
+      ["second", "third"],
+    );
+  } finally {
+    await reader.close(context);
+  }
+});
+
+test("directory pages are bounded and cleanup closes persistent readers and watchers", async (t) => {
+  const { env, client } = await fixture(t, { maxDirectoryEntries: 1 });
+  value(await env.writeFile("file", "data", context));
+  const file = value(await env.openBinaryReader("file", undefined, context));
+  const directory = value(await env.openDirReader(".", context));
+  assert.equal((await directory.next(2, context)).error.code, "invalid");
+  assert.equal(value(await directory.next(1, context)).entries[0].name, "file");
+  let changes = 0;
+  const watcher = value(await env.watch([{ path: "file" }], () => changes++, context));
+  await env.cleanup(context);
+  assert.equal(client.children.size, 0);
+  assert.equal((await file.read(0, 1, context)).ok, false);
+  assert.equal((await directory.next(1, context)).ok, false);
+  await watcher.close(context);
+  assert.equal(changes, 0);
+});
+
 test("shell output streams before completion and preserves nonzero exits", async (t) => {
   const { env } = await fixture(t);
   let output = "";

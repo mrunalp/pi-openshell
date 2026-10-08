@@ -35,6 +35,11 @@ export class WorkerStream {
     return this.iterator.next();
   }
 
+  write(command: Record<string, unknown>): void {
+    if (this.closed) throw new Error("Worker stream is closed");
+    this.session.write(Buffer.from(`${JSON.stringify(command)}\n`));
+  }
+
   cancel(): Promise<void> {
     if (this.closed) return Promise.resolve();
     this.cancelling ??= this.stop();
@@ -132,7 +137,9 @@ export class OpenShellTransport {
     workerSource ??= readFile(new URL("./worker.mjs", import.meta.url), "utf8");
     const source = await workerSource;
     signal?.throwIfAborted();
-    const controlledShell = request.op === "shell" || request.op === "http";
+    const controlledShell = ["shell", "http", "binary-reader", "dir-reader", "watch"].includes(
+      String(request.op),
+    );
     const rpcController = new AbortController();
     const launchAbort = () => rpcController.abort();
     signal?.addEventListener("abort", launchAbort, { once: true });

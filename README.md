@@ -10,7 +10,7 @@ provider supplies an opaque credential placeholder; OpenShell substitutes the
 real API key at the profile-authorized endpoint. The Pi process needs no model
 API key.
 
-This version implements Pi Durable 1.0.0's complete `ExecutionEnv`, a conversation
+This version implements Pi Durable 1.1.0's complete `ExecutionEnv`, a conversation
 document resolver, OpenAI Responses transport, and operator-side deployment
 helpers. Automatic worker replacement, execution reattachment, and an interactive
 Pi coding-agent extension are follow-up work. This is a Durable application
@@ -107,7 +107,7 @@ the configured executables. Review the policies and provider profile when
 changing images or executable paths.
 
 ```shell
-npm install git+https://github.com/mrunalp/pi-openshell.git @earendil-works/pi-durable@1.0.0 @earendil-works/pi-ai@1.0.0
+npm install git+https://github.com/mrunalp/pi-openshell.git @earendil-works/pi-durable@1.1.0 @earendil-works/pi-ai@1.1.0
 ```
 
 OpenShell's SDK is currently distributed through GitHub Packages. Follow the
@@ -337,9 +337,15 @@ invoked with `node` directly.
   file lives in the sandbox. POSIX path joining on the harness performs no I/O.
 - Line readers stream with backpressure and preserve CRLF and whether the final
   line ends in a newline. Binary data uses base64 framing.
+- Positional binary readers keep one file open in the sandbox across reads and
+  line scans, even if its path is replaced. Directory readers page metadata.
+  File watchers report sandbox-local changes using Pi's native or polling mode.
+  Pi's filesystem helpers are bundled into the worker during the build.
 - Shell output streams as it arrives. Nonzero command exit codes remain normal
   `ShellExecResult` values for Pi's Bash tool to interpret. Timeouts, cancellation,
   and callback failures stop ordinary members of the helper's shell process group.
+- Command arrays run directly without shell parsing. Output callbacks receive
+  the source stream (`stdout` or `stderr`).
 - Cancellation sends a control frame and keeps the exec stream alive while the
   helper stops and reaps the command. It falls back to transport cancellation
   after two seconds. A lost connection or forced helper termination can leave
@@ -380,8 +386,9 @@ through `createOpenShellOpenAIProvider()` use the bound sandbox's attached
 provider and effective network policy. Other host model clients retain their
 own inference configuration and can bypass this integration.
 
-The adapter checks the bound sandbox UUID, name, and workspace before every
-operation. The deployment helper also verifies both UUIDs before teardown.
+The adapter checks the bound sandbox UUID, name, and workspace before launching
+each helper. Open readers and watchers keep using that helper in the original
+sandbox. The deployment helper also verifies both UUIDs before teardown.
 Current public exec and SDK deletion target sandboxes by name, so these checks
 are not atomic with the operation. Do not delete and reuse a bound name while a
 harness or deployment command is active. Server-side expected-UUID preconditions
@@ -400,6 +407,8 @@ fixture, then drive Pi Durable's real built-in read/write/edit/bash tools throug
 the adapter. They also check fork behavior, binary and metacharacter handling,
 spill preservation, cancellation of descendants, stale bindings, and incomplete
 transport responses. The test fixture is not a local fallback shipped to users.
+Pi Durable's environment conformance suite checks positional reads, line scans,
+directory paging, file watching, argv execution, and output stream metadata.
 
 For a live SDK/gateway test, install the SDK and provide an existing sandbox:
 
@@ -441,7 +450,8 @@ resources afterward. `test:provider:live` remains an alias. It uses a host-local
 mock Responses API over HTTP and no paid model service;
 the caller needs permission to manage profiles, providers, and sandboxes.
 
-Locally verified on October 1, 2026 with Pi Durable 1.0.0, the TypeScript SDK and
+The Pi 1.1.0 upgrade passes the local checks and environment conformance suite.
+The live integration was last verified on October 1, 2026 with Pi Durable 1.0.0, the TypeScript SDK and
 gateway/runtime/supervisor built from OpenShell commit `76cfd0e31d5e`, rootless
 Podman, mTLS, and the community base workload image with Node 22.22.1. Tool-only
 tests used a deterministic model. The two-worker test verified the default

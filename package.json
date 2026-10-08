@@ -26,6 +26,7 @@
     "dist",
     "README.md",
     "LICENSE",
+    "THIRD_PARTY_NOTICES",
     "examples",
     "providers",
     "policies"
@@ -44,8 +45,8 @@
     "prepare": "npm run build"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "1.0.0",
-    "@earendil-works/pi-durable": "1.0.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-durable": "1.1.0",
     "@nvidia/openshell-sdk": ">=0.0.0 <1.0.0"
   },
   "peerDependenciesMeta": {
@@ -54,9 +55,10 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-durable": "1.0.0",
     "@biomejs/biome": "2.5.4",
+    "@earendil-works/pi-durable": "1.1.0",
     "@types/node": "^24",
+    "esbuild": "0.28.2",
     "typescript": "6.0.3"
   }
 }

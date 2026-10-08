@@ -1,18 +1,25 @@
 import { posix } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import {
+  type BinaryReader,
+  type DirReader,
   type ExecutionEnv,
   ExecutionError,
   err,
   FileError,
   type FileErrorCode,
   type FileInfo,
+  type FileWatcher,
+  type LineScan,
   ok,
   type Result,
   type ShellExecOptions,
   type ShellExecResult,
+  StreamDecoder,
   type TextLine,
   type TextLineReader,
+  type WatchChange,
+  type WatchTarget,
 } from "@earendil-works/pi-durable/env";
 import type { SandboxBinding, SandboxClient } from "./client.js";
 import { decodeBase64, record, type WorkerError } from "./protocol.js";
@@ -69,6 +76,10 @@ function fileError(error: unknown, path?: string, aborted = false): FileError {
     invalid: "invalid",
     not_supported: "not_supported",
     aborted: "aborted",
+    not_found: "not_found",
+    permission_denied: "permission_denied",
+    not_directory: "not_directory",
+    is_directory: "is_directory",
   };
   return new FileError(
     codes[remote?.code ?? ""] ?? "unknown",
@@ -98,6 +109,92 @@ interface Operation {
   stream: WorkerStream;
   controller: AbortController;
   finish(): Promise<void>;
+}
+
+class RemoteReader {
+  private closed = false;
+  private pending: Promise<unknown> = Promise.resolve();
+
+  constructor(
+    private readonly operation: Operation,
+    private readonly path: string,
+    private readonly timeoutMs: number,
+  ) {}
+
+  call<T>(
+    command: Record<string, unknown>,
+    context: Context,
+    decode: (value: unknown) => T,
+  ): Promise<Result<T, FileError>> {
+    const result = this.pending.then(async (): Promise<Result<T, FileError>> => {
+      if (this.closed) return err(new FileError("invalid", "Reader is closed", this.path));
+      if (context.abortSignal?.aborted) return err(new FileError("aborted", "Operation aborted", this.path));
+      const abort = () => this.operation.controller.abort();
+      const timer = setTimeout(abort, this.timeoutMs);
+      context.abortSignal?.addEventListener("abort", abort, { once: true });
+      try {
+        this.operation.stream.write(command);
+        const next = await this.operation.stream.next();
+        if (next.done) throw new Error("Reader ended without a response");
+        if (next.value.type === "error") throw new RemoteError(next.value.error);
+        if (next.value.type !== "reply" || !record(next.value.value))
+          throw new Error("Invalid reader response");
+        const response = next.value.value;
+        if (response.ok === false && record(response.error))
+          return err(fileError(new RemoteError(response.error as unknown as WorkerError), this.path));
+        if (response.ok !== true) throw new Error("Invalid reader result");
+        return ok(decode(response.value));
+      } catch (error) {
+        this.closed = true;
+        await this.operation.finish();
+        return err(fileError(error, this.path, context.abortSignal?.aborted));
+      } finally {
+        clearTimeout(timer);
+        context.abortSignal?.removeEventListener("abort", abort);
+      }
+    });
+    this.pending = result;
+    return result;
+  }
+
+  async close(_context: Context): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    // Cancellation wakes an in-flight read and closes the sandbox handle.
+    await this.operation.finish();
+    await this.pending;
+  }
+}
+
+function lineScan(value: unknown): LineScan {
+  if (!record(value)) throw new Error("Invalid line scan");
+  for (const key of [
+    "newlines",
+    "start",
+    "end",
+    "firstLineEnd",
+    "lastLineStart",
+    "selectedBytes",
+    "firstLineBytes",
+  ])
+    if (!Number.isSafeInteger(value[key]) || Number(value[key]) < 0) throw new Error("Invalid line scan");
+  return value as unknown as LineScan;
+}
+
+function directoryPage(value: unknown): { entries: FileInfo[]; done: boolean } {
+  if (!record(value) || !Array.isArray(value.entries) || typeof value.done !== "boolean")
+    throw new Error("Invalid directory page");
+  return { entries: value.entries.map(fileInfo), done: value.done };
+}
+
+function watchChange(value: unknown): WatchChange {
+  if (!record(value)) throw new Error("Invalid watch event");
+  if (Array.isArray(value.paths) && value.paths.every((path) => typeof path === "string"))
+    return { paths: value.paths };
+  if (value.overflow === true) return { overflow: true };
+  if (record(value.error) && typeof value.error.code === "string" && typeof value.error.message === "string")
+    return { error: fileError(new RemoteError(value.error as unknown as WorkerError)) };
+  throw new Error("Invalid watch event");
 }
 
 class RemoteLineReader implements TextLineReader {
@@ -263,6 +360,100 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
     return this.call({ op: "read", path }, context, decodeBase64);
   }
 
+  private async openReader(
+    request: Record<string, unknown> & { path: string },
+    context: Context,
+  ): Promise<Result<RemoteReader, FileError>> {
+    let operation: Operation | undefined;
+    try {
+      operation = await this.start(request, context);
+      const next = await operation.stream.next();
+      if (next.done) throw new Error("Reader returned no response");
+      if (next.value.type === "error") throw new RemoteError(next.value.error);
+      if (next.value.type !== "ready") throw new Error("Invalid reader handshake");
+      return ok(new RemoteReader(operation, request.path, this.fileTimeoutMs));
+    } catch (error) {
+      await operation?.finish();
+      return err(fileError(error, request.path, context.abortSignal?.aborted));
+    }
+  }
+
+  async openBinaryReader(
+    path: string,
+    options: { noFollow?: boolean } | undefined,
+    context: Context,
+  ): Promise<Result<BinaryReader, FileError>> {
+    const result = await this.openReader({ op: "binary-reader", path, options }, context);
+    if (!result.ok) return result;
+    const reader = result.value;
+    return ok({
+      info: (context) => reader.call({ type: "info" }, context, fileInfo),
+      read: (offset, length, context) => reader.call({ type: "read", offset, length }, context, decodeBase64),
+      scanLines: (options, context) => reader.call({ type: "scan", options }, context, lineScan),
+      close: (context) => reader.close(context),
+    });
+  }
+
+  async openDirReader(path: string, context: Context): Promise<Result<DirReader, FileError>> {
+    const result = await this.openReader({ op: "dir-reader", path }, context);
+    if (!result.ok) return result;
+    const reader = result.value;
+    return ok({
+      next: (maxEntries, context) => reader.call({ type: "next", maxEntries }, context, directoryPage),
+      close: (context) => reader.close(context),
+    });
+  }
+
+  async watch(
+    targets: readonly WatchTarget[],
+    onChange: (change: WatchChange) => void,
+    context: Context,
+  ): Promise<Result<FileWatcher, FileError>> {
+    let operation: Operation | undefined;
+    try {
+      operation = await this.start({ op: "watch", targets }, context);
+      const next = await operation.stream.next();
+      if (next.done) throw new Error("Watcher returned no response");
+      if (next.value.type === "error") throw new RemoteError(next.value.error);
+      if (next.value.type !== "reply" || (next.value.value !== "native" && next.value.value !== "polling"))
+        throw new Error("Invalid watcher handshake");
+      const mode = next.value.value;
+      const active = operation;
+      let closed = false;
+      const pump = (async () => {
+        try {
+          for (;;) {
+            const next = await active.stream.next();
+            if (closed) break;
+            if (next.done) throw new Error("Watcher ended unexpectedly");
+            if (next.value.type === "error") throw new RemoteError(next.value.error);
+            if (next.value.type !== "watch") throw new Error("Invalid watcher frame");
+            const change = watchChange(next.value.value);
+            onChange(change);
+            if ("error" in change) break;
+          }
+        } catch (error) {
+          if (!closed && !active.controller.signal.aborted && !context.abortSignal?.aborted)
+            onChange({ error: fileError(error) });
+        } finally {
+          await active.finish();
+        }
+      })();
+      void pump.catch(() => {});
+      return ok({
+        mode,
+        async close() {
+          closed = true;
+          await active.finish();
+          await pump;
+        },
+      });
+    } catch (error) {
+      await operation?.finish();
+      return err(fileError(error, undefined, context.abortSignal?.aborted));
+    }
+  }
+
   async readTextFile(path: string, context: Context): Promise<Result<string, FileError>> {
     const result = await this.readBinaryFile(path, context);
     return result.ok ? ok(Buffer.from(result.value).toString("utf8")) : result;
@@ -396,7 +587,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
   }
 
   async exec(
-    command: string,
+    command: string | readonly string[],
     options: ShellExecOptions | undefined,
     context: Context,
   ): Promise<Result<ShellExecResult, ExecutionError>> {
@@ -404,8 +595,13 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
     let operation: Operation | undefined;
     let spillPath: string | undefined;
     let callbackError: Error | undefined;
-    const decoders = { stdout: new TextDecoder(), stderr: new TextDecoder() };
+    const decoders = { stdout: new StreamDecoder(), stderr: new StreamDecoder() };
     try {
+      if (
+        typeof command !== "string" &&
+        (command.length === 0 || command.some((arg) => typeof arg !== "string" || arg.includes("\0")))
+      )
+        return err(new ExecutionError("spawn_error", "Invalid command argv"));
       if (
         options?.timeout !== undefined &&
         (!Number.isFinite(options.timeout) || options.timeout <= 0 || options.timeout * 1000 > 2_147_483_647)
@@ -433,11 +629,11 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
         },
         context,
       );
-      const output = (text: string) => {
+      const output = (text: string, stream: "stdout" | "stderr") => {
         if (text === "" || options?.onOutput === undefined || callbackError || context.abortSignal?.aborted)
           return;
         try {
-          options.onOutput(text, context);
+          options.onOutput(text, context, { stream });
         } catch (error) {
           callbackError = error instanceof Error ? error : new Error(String(error));
           operation?.controller.abort();
@@ -451,7 +647,7 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
         const frame = next.value;
         switch (frame.type) {
           case "output":
-            output(decoders[frame.stream].decode(decodeBase64(frame.data), { stream: true }));
+            output(decoders[frame.stream].decode(decodeBase64(frame.data)), frame.stream);
             break;
           case "spill":
             spillPath = frame.path;
@@ -478,8 +674,8 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
             throw new Error("Unexpected shell worker frame");
         }
       }
-      output(decoders.stdout.decode());
-      output(decoders.stderr.decode());
+      output(decoders.stdout.decode(), "stdout");
+      output(decoders.stderr.decode(), "stderr");
       if (callbackError !== undefined) throw callbackError;
       if (remoteError !== undefined) throw remoteError;
       if (result === undefined) throw new Error("Shell execution ended without a result");
@@ -495,7 +691,9 @@ export class OpenShellExecutionEnv implements ExecutionEnv {
             : remote?.code === "aborted"
               ? "aborted"
               : remote?.code === "ENOENT"
-                ? "shell_unavailable"
+                ? typeof command === "string"
+                  ? "shell_unavailable"
+                  : "spawn_error"
                 : "unknown";
       const failure = new ExecutionError(code, error instanceof Error ? error.message : String(error));
       failure.spillPath = remote?.spillPath ?? spillPath;
